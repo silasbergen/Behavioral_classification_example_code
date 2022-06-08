@@ -85,6 +85,70 @@ grid1_res %>%
   arrange(merror) 
 
 
+######################################
+###5-fold CV and model assessment
+######################################
+
+
+df <- eagle_subset %>% 
+  select(DEM_IA, TPI_IA,
+         Slope_IA, d2water_IA,d2edge_IA, d2Landfills_IA,
+         d2Feedlots_IA, d2streets, d2nestsV2_IA, northness,month_factor,Season_longshort) 
+X <- model.matrix(~.-1, data = df)
+dX <- xgb.DMatrix(X, label = eagle_subset$risk_class)
+
+
+
+set.seed(282828)
+cv5_id <- sample(1:5, nrow(eagle_subset),replace=TRUE)
+
+fold_list <- list() 
+for(i in 1:5) fold_list[[i]] <- which(cv5_id==i)
+(lapply(fold_list, length) %>% unlist)/nrow(eagle_subset)
+
+
+cv5.boost <- xgb.cv(data=dX, params = list(max_depth = 26, 
+                                           eta = 0.1, 
+                                           colsample_bytree = 0.9,
+                                           subsample = 1,
+                                           num_class = 3,
+                                           gamma = 0,
+                                           lambda = 2),
+                    nrounds = 125,
+                    objective = "multi:softprob", 
+                    eval_metric = 'mlogloss',
+                    folds = fold_list, 
+                    print_every_n = 20,
+                    prediction = TRUE,showsd = FALSE)
+
+
+
+xgboost.phat <- cv5.boost$pred
+xgboost.predclass <- apply(xgboost.phat, 1, function(x) which.max(x)-1)
+
+
+##Function to compute pairwise and averaged pairwise area under ROC curve
+multiroc <- function(y, pmat) {
+  library(pROC)
+  df <- data.frame(y,pmat) 
+  names(df) <- c('y','c0','c1','c2')
+  d01 <- df %>% mutate(p = c0/(c0+c1)) %>%   filter(y!=2)
+  d02 <- df %>% mutate(p = c0/(c0+c2)) %>% filter(y!=1)
+  d12 <- df %>% mutate(p = c1/(c1+c2)) %>% filter(y!=0)
+  roc01 <- roc(factor(y)~p, data = d01)$auc %>% as.numeric
+  roc02 <- roc(factor(y)~p, data = d02)$auc %>% as.numeric
+  roc12 <- roc(factor(y)~p, data = d12)$auc %>% as.numeric
+  overall_roc <- 2*(roc01 + roc02 + roc12)/6
+  pairwise_auc <- c(roc01, roc02, roc12)
+  return(list(pairwise_auc, overall_roc))
+}
+
+
+(xgboost.mroc <- multiroc(eagle_subset$risk_class, xgboost.phat))
+(cmat_xgboost <- caret::confusionMatrix(reference = factor(eagle_subset$risk_class), data = factor(xgboost.predclass)))
+
+
+
 #############################################
 ##FIT XGBOOST MODEL TO ENTIRE DATA:
 #############################################
