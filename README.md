@@ -15,6 +15,7 @@ Contents of repository:
   - Feature importance with SHAP values
   - ICE/PDP plots and SHAP plots
 * xgboost_tutorial.docx: knitted Word version of tutorial.
+* Format_file.docx: format specifications for tutorial.
 * The other `.R` files provide code for searching a parameter grid, carrying out 5-fold cross-validation, and model assessment (pairwise area under ROC curve, confusion matrices, and by-class assessment metrics) for the other supervised learning methods:
   - `knn_train.R`: weighted k-nearest neighbors
   - `nnet_train.R`: neural nets
