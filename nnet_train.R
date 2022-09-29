@@ -1,8 +1,8 @@
 library(dplyr)
 library(nnet)
 
-eagle_subset <- read.csv('https://github.com/silasbergen/XGBoost_example_code/raw/main/eagle_subset.csv')
-
+setwd(dirname(rstudioapi::getActiveDocumentContext()$path))
+eagle_subset <- read.csv('eagle_subset.csv')
 
 
 df <- eagle_subset %>% 
