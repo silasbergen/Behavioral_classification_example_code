@@ -1,8 +1,8 @@
 # Overview
 
- Supporting information for *A review of supervised learning methods for classifying animal behavioral states from environmental  features* by Bergen et al.
+ Tutorial for demonstrating implementation of  XGBoost to classify polytomous animal behavior from environmental features.  Supporting information for *A review of supervised learning methods for classifying animal behavioral states from environmental  features* by Bergen et al.
  
- Subset of 10,000 GPS points and tutorial for implementing XGBoost to classify polytomous animal behavior from environmental features. 
+Contents of repository:
 
 * `eagle_subset.csv`: Subset of 10,000 GPS points with variables `risk_class` (3-level risk classification) and predictor features
 * `xgboost_tutorial.Rmd`: R Markdown source file detailing implementation of XGBoost, specifically:
