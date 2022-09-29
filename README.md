@@ -20,4 +20,7 @@ Contents of repository:
   - `knn_train.R`: weighted k-nearest neighbors
   - `nnet_train.R`: neural nets
   - `randomforest_train.R`: random forests
+  
+  [![DOI](https://zenodo.org/badge/500933599.svg)](https://zenodo.org/badge/latestdoi/500933599)
+
 
