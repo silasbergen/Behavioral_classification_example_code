@@ -1,0 +1,503 @@
+---
+title: "Classifying polytomous behavior from environmental features: Model selection, assessment, and interpretation using XGBoost"
+author: "Additional supporting information for *Classifying animal movement from environmental features: a review of boosted classification trees and XGBoost with an example for bald eagles and wind turbines*"
+date: "Silas Bergen, Manuela M. Huso, Adam E. Duerr, Missy A. Braham, Sara Schmuecker, Tricia A. Miller, Todd E. Katzner"
+output:
+  word_document: 
+    reference_docx: Format_file.docx
+editor_options:
+  chunk_output_type: console
+---
+
+# Introduction 
+The following provides detailed examples of fitting, selecting, assessing, and interpreting the XGBoost model when using environmental features to predict a polytomous animal behavioral response.  This document supports  *A review of supervised learning methods for classifying animal behavioral states from environmental features* by Bergen et al.
+
+
+# Data
+
+For this tutorial we will use in a subset of 10,000 flight points measured by GPS attached to bald eagles in Iowa, USA.  The following code reads in the data file, assuming the data file is in the same directory as this R script.
+
+```{r}
+setwd(dirname(rstudioapi::getActiveDocumentContext()$path))
+eagle_subset <- read.csv('eagle_subset.csv')
+#Make sure month is ordered chronologically; comes in useful for plotting later:
+eagle_subset$month_factor <- factor(eagle_subset$month_factor, levels = month.abb)
+head(eagle_subset)
+```
+
+The columns `Season_longshort`, `DEM_IA`,...,`d2nestsV2_IA`, `northness`, and `month_factor` are the features we want to use to predict `risk_class`.  Accordingly we have 12 features, 2 of which (`month_factor` and `Season_longshort`) are factor variables and the others (`DEM_IA` through `northness`) are numeric.  The response variable to predicted is `risk_class` which assumes values 0 (low risk), 1 (moderate risk), or 2 (high risk):
+
+```{r}
+xtabs(~risk_class + risk_name, data = eagle_subset)
+```
+
+Note that `risk_class` is numeric; this is important as the `xgboost` package requires a numeric response even when fitting classification methods:
+
+```{r}
+class(eagle_subset$risk_class)
+```
+
+
+The `validation_set` column indicates which GPS points will be used to train and which will be used to test the SL methods.  Roughly 2/3 of the data are used to train, the rest to test:
+
+```{r}
+xtabs(~validation_set, data = eagle_subset)
+```
+
+# Loading libraries
+
+We will now load the libraries we will need for the following SL applications and assessments. 
+
+```{r, message=FALSE}
+library(dplyr)
+library(xgboost)
+library(tidyr)
+library(ggplot2)
+```
+
+# The XGBoost method
+
+## Data structures
+
+To set up the data for XGBoost we select the predictor features, split the data into training and test sets, and one-hot encode the factor variables:
+
+```{r}
+df <- eagle_subset %>% 
+  dplyr::select(risk_class, DEM_IA, TPI_IA,
+         Slope_IA, d2water_IA,d2edge_IA, d2Landfills_IA,
+         d2Feedlots_IA, d2streets, d2nestsV2_IA, northness,month_factor, Season_longshort,validation_set) 
+train <- df %>% filter(validation_set=='Train') %>% dplyr::select(-validation_set) 
+test <- df %>% filter(validation_set=='Test') %>% dplyr::select(-validation_set) 
+trainX <- model.matrix(~.-1, data = train %>% dplyr::select(-risk_class))
+testX <- model.matrix(~.-1, data = test%>% dplyr::select(-risk_class))
+head(trainX, 3)
+```
+
+We then create the data structures we will need for the `xgboost` package functions.  Note the creation of the response by way of the `label =` argument:
+
+```{r}
+dtrain <- xgb.DMatrix(trainX, label = train$risk_class)
+dtest <- xgb.DMatrix(testX, label = test$risk_class)
+```
+
+## Model selection 
+
+We are now ready to set up the tuning parameter grid.
+```{r}
+##########################################################################################
+#Setting up the tuning parameter grid
+#M: the maximum allowed depth of each tree
+#csp: proportion of columns sampled for each tree in the boosting sequence
+#rsp: proportion of training rows sampled for each tree in the boosting sequence
+#eta: shrinkage parameter
+#lambda: penalty parameter on leaf weights
+#gamma: penalty parameter on number of leaves
+#########################################################################################
+
+grid1 <- expand.grid(M = seq(16,20,by=2),
+                       csp = seq(.6,1,by=.2),
+                       rsp=seq(.6,1,by=.2),
+                       eta = c(0.1,0.2,0.3), lambda = c(0,1,2), gamma = c(0,1,2))
+
+```
+
+
+Next we set up the list we will use to collect the training results:
+
+```{r}
+grid1_results <- list()
+```
+
+
+By default, `xgb.train()` (the primary XGBoost training function) will return the value of the last `eval_metric` provided (which, as we will see below, is the multi-class log-loss).  This function parses the training message to also return the value of the misclassification error:
+```{r}
+##Function to get the misclassification error from the XGBoost messages
+
+getmerror <- function(msg) {
+  splits <- strsplit(msg,":|\\\ttest", fixed=FALSE)
+  want <- as.numeric(do.call(rbind,splits)[,3])
+  return(want)
+}
+```
+
+
+Now we're ready to train!  This code will train the first 5 parameter combinations, printing progress notifications along the way, and evaluating training time:
+```{r}
+#Train the first 5 parameter combos:
+
+for(i in 1:5) {
+    paramvec <- grid1[i,]
+    p <- with(paramvec, list(max_depth = M, 
+                             colsample_bytree = csp,
+                             subsample = rsp,
+                             eta = eta, gamma = gamma, lambda = lambda,
+                             num_class = 3))
+    cat("################################\n")
+    print(paste('Training ',i,'of',nrow(grid1)))
+    print(Sys.time())
+    print(unlist(p))
+    set.seed(1122021)
+    time.start <- Sys.time()
+    boostit <- xgb.train(params = p, data=dtrain, nrounds = 20000,
+                         objective = "multi:softprob", 
+                         eval_metric="merror", 
+                         eval_metric="mlogloss", 
+                         watchlist = list(test = dtest), 
+                         early_stopping_rounds = 10,
+                         print_every_n = 50)
+    time.end <- Sys.time()
+    train.time <- as.numeric(difftime(time.end, time.start, units='mins'))
+    print(paste('Train time = ', train.time))
+    grid1_results[[i]] <- data.frame(boostit$params, bestiter = boostit$best_iteration,
+                           bestscore = boostit$best_score, bestmsg = boostit$best_msg,
+                           runtime = train.time,
+                           merror = getmerror(boostit$best_msg))
+    #Uncomment the line below to save the grid search after each iteration
+    #save(grid1_results, file = 'grid1_results.Rdata')
+}
+```
+
+
+Some of the important arguments to the `xgb.train()` function:
+
+* `params`- a vector of modeling tuning parameters;
+* `data` - the training data of class `xgb.DMatrix`;
+* `nrounds` - maximum number of boosting iterations considered;
+* `objective` - specifies the classification problem, and whether to output class probabilities (`multi:softprob`) or predicted classes (`multi:softmax`);
+* `eval_metric` - the evaluation metric to use for finding the optimal number of boosting iterations.  If multiple `eval_metrics` are specified, the last one will be used;
+* `watchlist` - a list containing an object of class `xgb.DMatrix`; the boosting will proceed until the `eval_metric` has not improved for `early_stopping_round` iterations;
+* `early_stopping_round` - if set to $k$, training will stop if the performance doesn't improve for $k$ rounds.
+
+Next, we create a data frame of the training results and print some selected columns:
+
+```{r}
+grid1_res <- do.call(rbind, grid1_results)
+grid1_res %>% 
+  arrange(merror) %>% 
+  dplyr::select(max_depth:num_class, bestiter, bestscore, runtime, merror)
+```
+
+
+## Model assessment
+
+Having found our "best" tuning parameter combination, we will carry out 5-fold cross-validation by splitting the entire data set into 5 folds and assess the model's predictive accuracy.  Note that we fix `nrounds` (the number of boosting iterations) equal to the `bestiter` value from our parameter grid search.
+
+
+```{r}
+######################################
+###5-fold CV and model assessment
+######################################
+
+
+fullmodel_df <- eagle_subset %>% 
+  dplyr::select(DEM_IA, TPI_IA,
+         Slope_IA, d2water_IA,d2edge_IA, d2Landfills_IA,
+         d2Feedlots_IA, d2streets, d2nestsV2_IA, northness,month_factor,Season_longshort) 
+X <- model.matrix(~.-1, data = fullmodel_df)
+dX <- xgb.DMatrix(X, label = eagle_subset$risk_class)
+
+
+
+## Creating the 5 "folds" and putting the indices of each fold in a list:
+set.seed(282828)
+cv5_id <- sample(1:5, nrow(eagle_subset),replace=TRUE)
+fold_list <- list() 
+for(i in 1:5) fold_list[[i]] <- which(cv5_id==i)
+
+
+## XGBoost has its own K-fold cross-validation function:
+cv5.boost <- xgb.cv(data=dX, params = list(max_depth = 16, 
+                                           eta = 0.1, 
+                                           colsample_bytree = 0.8,
+                                           subsample = 0.6,
+                                           num_class = 3,
+                                           gamma = 0,
+                                           lambda = 0),
+                    nrounds = 26,
+                    objective = "multi:softprob", 
+                    eval_metric = 'mlogloss',
+                    folds = fold_list, 
+                    print_every_n = 20,
+                    prediction = TRUE,showsd = FALSE)
+```
+
+
+We then put the predicted class probabilities in a matrix and compute the predicted classes as the maximum of the three probabilities:
+
+```{r}
+xgboost.phat <- cv5.boost$pred
+xgboost.predclass <- apply(xgboost.phat, 1, function(x) which.max(x)-1)
+head(xgboost.phat)
+head(xgboost.predclass)
+```
+
+
+To assess the model, we compute pairwise area under the ROC curve (auROC) and average these to find the overall auROC.  
+
+```{r, message = FALSE}
+##Function to compute pairwise and averaged pairwise area under ROC curve
+multiroc <- function(y, pmat) {
+  library(pROC)
+  df <- data.frame(y,pmat) 
+  names(df) <- c('y','c0','c1','c2')
+  d01 <- df %>% mutate(p = c0/(c0+c1)) %>%   filter(y!=2)
+  d02 <- df %>% mutate(p = c0/(c0+c2)) %>% filter(y!=1)
+  d12 <- df %>% mutate(p = c1/(c1+c2)) %>% filter(y!=0)
+  roc01 <- roc(factor(y)~p, data = d01)$auc %>% as.numeric
+  roc02 <- roc(factor(y)~p, data = d02)$auc %>% as.numeric
+  roc12 <- roc(factor(y)~p, data = d12)$auc %>% as.numeric
+  overall_roc <- 2*(roc01 + roc02 + roc12)/6
+  pairwise_auc <- c('0v1'=roc01, '0v2'=roc02, '1v2'=roc12)
+  return(list('pairwise'=pairwise_auc, 'overall'=overall_roc))
+}
+
+##Evaluating pairwise auROCs:
+multiroc(eagle_subset$risk_class, xgboost.phat)
+```
+
+Thus we have an auROC of 68.9% for evaluating low versus moderate risk; 74.7% for evaluating low versus high risk; and 61.1% for evaluating moderate versus high risk.  Averaging these three gives us an overall auROC of 67.9%.  These results are not great, and could be improved with a less hasty parameter search and larger portion of the original data. 
+
+We can also assess model accuracy by computing the confusion matrix.  The `confusionMatrix()` function from the `caret` package computes additional prediction accuracy metrics as well such as class-specific sensitivity, specificity, and positive and negative predictive values.
+
+```{r, message = FALSE}
+caret::confusionMatrix(reference = factor(eagle_subset$risk_class), data = factor(xgboost.predclass))
+```
+
+Overall we have 65.1% correct classification.  The "by-class" statistics provide more detail as to how the model performs classifying one class versus the other ($k-1$) classes.
+
+
+Finally, we fit the "best" XGBoost model to the entire data.  We will use this best model to investigate variable importance and relationships with predicted class probabilities:
+
+```{r}
+#############################################
+##FIT XGBOOST MODEL TO ENTIRE DATA:
+#############################################
+
+
+X <- model.matrix(~.-1, data = fullmodel_df)
+dX <- xgb.DMatrix(X, label = eagle_subset$risk_class)
+
+best_xgmod <- xgb.train(data=dX, list(max_depth = 16, 
+                                           eta = 0.1, 
+                                           colsample_bytree = 0.8,
+                                           subsample = 0.6,
+                                           num_class = 3,
+                                           gamma = 0,
+                                           lambda = 0),
+                        nrounds = 26,
+                        objective = "multi:softprob", 
+                        eval_metric = 'mlogloss')
+
+```
+
+
+
+## Interpreting the XGBoost model
+
+### SHAP values 
+
+Having fit the "best" XGBoost model to the entire data set we can return the SHAP values, which measure the contribution of each observation's feature values to its predicted class probabilities.  Here we create SHAP values for the entire data set (consisting of only 10,000 rows); in practice if the entire data set consists of many more rows it may be necessary to create SHAP values for a subset to make computational time feasible. Setting `approxcontrib=TRUE` also aids computational time.
+
+```{r}
+shapvals <- predict(best_xgmod, newdata = X, predcontrib  = TRUE, approxcontrib = TRUE)
+```
+
+
+The output `shapvals` is a list of length $k$ (number of classes), each list a matrix with one row per observation and one column per feature:
+
+```{r}
+length(shapvals)
+dim(shapvals[[1]])
+```
+
+Combining these lists and finding the mean absolute value of the SHAP values for each feature and each predicted class allows us to identify predictor features that contribute the most to predicted class probabilities:
+
+```{r, message = FALSE}
+
+nshapvals <- nrow(shapvals[[1]])
+
+meanabs <- function(x) mean(abs(x))
+
+shap_summary_df <- do.call(rbind, shapvals) %>% 
+  data.frame() %>% 
+  dplyr::select(-BIAS) %>% 
+  mutate(class = rep(0:2, each = nshapvals)) %>% 
+  mutate(rowid = rep(1:nshapvals, 3)) %>% 
+  gather(key = variable, value = value, DEM_IA:Season_longshortLocal.movements) %>% 
+  group_by(variable, class) %>% 
+  summarize(meanshap =  meanabs(value)) %>% 
+  ungroup(variable) %>% 
+  mutate(variable = reorder(variable, meanshap, FUN = mean))
+  
+head(shap_summary_df)
+```
+
+
+Plotting these mean absolute SHAP values illustrates the importance of each predictor feature:
+
+```{r}
+ggplot(data = shap_summary_df) + 
+    geom_bar(aes(x = meanshap, y= variable), stat = 'identity') + 
+  facet_wrap(~class) + 
+  xlab('Mean SHAP value') + 
+  ylab('Feature')
+```
+
+Here we can see that the `d2water`, `d2edge`, and `DEM` variables appear contribute the most to predicting class probabilities.
+
+Next we can examine relationships between the values of certain features and their associated SHAP values.  Here we plot the SHAP contributions of the `d2water` variable for each class:
+
+```{r, message = FALSE}
+d2water_shap <- data.frame(class = rep(0:2, each = nrow(df)),
+                           watershap = c(shapvals[[1]][,'d2water_IA'],
+                                        shapvals[[2]][,'d2water_IA'],
+                                        shapvals[[3]][,'d2water_IA']),
+                           d2water = rep(df$d2water_IA, 3)
+                            )
+
+ggplot(data = d2water_shap, aes(x = d2water, y = watershap)) + 
+  geom_point(shape = '.') +
+  geom_smooth() + 
+  facet_wrap(~class) + 
+  xlab('Distance to water (m)') + 
+  ylab('SHAP contributions to predicted class probabilities')
+```
+
+From this plot we can discern that large distances to water are associated with positive contributions to class 0 probabilities and negative contributions to class 2 probabilities.  Vertical variability in the points illustrates that the contributions are interacting with other predictor features that are not visualized.  
+
+We can investigate interactions between features by faceting.  In the next plot we demonstrate how the relationship of distance to landfill with contributions to class 2 probabilities varies by month:
+
+```{r, message = FALSE}
+### Add the class 2 D2Landfill SHAP values to original data frame 
+eagle_subset$landfill_shap <-  shapvals[[3]][,'d2Landfills_IA']
+
+
+### Create class 2 SHAP plot for D2Landfill
+ggplot(data = eagle_subset,aes(x = d2Landfills_IA, y = landfill_shap)) + 
+  geom_point( shape='.',alpha= 0.6) + 
+  xlab('Distance to landfill (m)') + 
+  ylab('SHAP contribution to predicted class 2 probabilities') + 
+  geom_smooth()
+
+
+### Faceted by month
+ggplot(data = eagle_subset,aes(x = d2Landfills_IA, y = landfill_shap)) + 
+  geom_point( shape='.',alpha= 0.6) + 
+  geom_smooth() + 
+  xlab('Distance to landfill (m)') + 
+  ylab('SHAP contribution to predicted class 2 probabilities') + 
+  facet_wrap(~month_factor)
+```
+
+We can discern from here that large values of distance to water are perhaps more strongly associated with increased contributions to class 2 probabilities in the summer months, though these relationships are slight.
+
+### ICE and partial dependence plots
+
+A single line on an individual conditional expectation (ICE) plot shows how predictions for each data point vary for changes in a predictor of interest, keeping all other predictors for that observation constant at their observed values.  The partial dependence is simply the average of all ICE lines.  Since plots of ICE involve one line per data point, to avoid overplotting it may be useful to subsample the data before creating ICEs and their subsequence partial dependencies.  In what follows we compute ICEs for a sample of 500 points and visualize them along with their partial dependencies.  
+
+```{r, message = FALSE}
+#To create the ICE's, form a sequence along each predictor and predict for the sequence.
+#All other variables are held constant.
+
+landvars <- eagle_subset %>% 
+  dplyr::select(DEM_IA, TPI_IA,
+                Slope_IA, d2water_IA,d2edge_IA, d2Landfills_IA,
+                d2Feedlots_IA, d2streets, d2nestsV2_IA, northness,month_factor,Season_longshort) %>% 
+  data.frame()
+
+allvars <- names(landvars)
+
+
+#Using SHAP plot to order:
+varnames <- c('d2water_IA','d2Landfills_IA','d2nestsV2_IA',
+                            'DEM_IA','d2Feedlots_IA','d2edge_IA','Slope_IA',
+                            'd2streets','TPI_IA','northness','Season_longshort','month_factor')
+pdp_df_list_multiclass <- list()
+
+
+
+##Creating the ICE for each variable for a Sample of 1000 points:
+
+for(i in 1:length(varnames)) {
+  feature <- varnames[i]
+  x <- landvars[,feature]
+  deciles <- NULL
+  if(!feature %in% c('month_factor','Season_longshort')) {
+    gridbounds <- quantile(x, c(.05, .95))
+    grid <- seq(gridbounds[1],gridbounds[2],l=50)
+    deciles <- quantile(x, seq(.1, .9, by = .1))
+  }
+  if(feature =='month_factor') grid <- factor(month.abb)
+  if(feature =='Season_longshort') grid <- factor(c('Dispersal/migration','Fledgling period','Local movements'))
+  set.seed(1234)
+  sampind <- sample(1:nrow(landvars),500,replace=FALSE)
+  Xpred <- landvars %>% 
+    dplyr::slice(sampind)%>%
+    dplyr::slice(rep(1:n(),each=length(grid)))
+  Xpred[,feature] <- rep(grid,length(sampind))
+  if(feature=='month_factor') Xpred[,feature] <- factor(Xpred[,feature],levels=month.abb)
+  Xpredmat <- model.matrix(~.-1, data = Xpred)
+  yhat <- predict(best_xgmod, newdata = Xpredmat)
+  yhat_mat <- matrix(yhat, nrow(Xpred),3,byrow = TRUE)
+  ice <- Xpred %>% 
+    mutate(p0 = yhat_mat[,1],
+           p1=yhat_mat[,2],
+           p2 = yhat_mat[,3]) %>% 
+    dplyr::select(feature, p0:p2) %>% 
+    mutate(rowid = rep(1:500,each=length(grid)))
+  names(ice)[1] <- 'ventile'
+  pdp <- ice %>%
+    group_by(ventile) %>% 
+    summarize(across(.cols=p0:p2,.fns=list(mean = mean,sd = sd)))
+  names(pdp)[1] <- names(ice)[1] <-  feature
+  print(paste('done with ',feature))
+  pdp_df_list_multiclass[[i]] <- list('feature' = feature, 'pdp' = pdp, 'deciles'=deciles,'ice'=ice)
+  #Uncomment below line to save data object as variables complete
+  #save(pdp_df_list_multiclass, file = 'pdp_df_list_multiclass.Rdata')
+}
+```
+
+
+The resulting list contains the name of the feature for which ICEs are computed; the partial dependence of the class probabilities on that feature; deciles of the distribution of the feature; and the ICEs themselves.  Using this we can create ICE and partial dependence plots:
+
+```{r, message = FALSE}
+###############################
+##ICE/PDP plot for d2water
+###############################
+
+waterdf <- pdp_df_list_multiclass[[1]]$ice %>% 
+  gather(key = p, value = ice, p0:p2)
+
+waterdeciles <- data.frame(deciles = pdp_df_list_multiclass[[1]]$deciles)
+
+(watericeplot <- ggplot(data = waterdf) + 
+    geom_line(aes(x = d2water_IA, y = ice, group=rowid),alpha = .2, size = .1) +
+    stat_summary(aes(x = d2water_IA, y = ice),fun='mean',col='goldenrod',geom='line',size = 1.5) + 
+    facet_wrap(~p, labeller = labeller(p = c('p0' = 'Class 0', 'p1' = 'Class 1','p2' = 'Class 2'))) + 
+    ylab('Probability') + xlab('D2 water (m)') + 
+    geom_point(aes(x = deciles, y = -0.01), shape='|', data = waterdeciles,col='black',size=1) + 
+    theme_classic() + 
+    theme(axis.text = element_text(color='black', size = 8)) + 
+    xlim(c(0,6203))+
+    ggtitle('ICE/PDP plot'))
+```
+
+Similarly to the SHAP plot, we can see that increasing distances to water appear to be associated with increasing class 0 probabilities and decreasing class 2 probabilities.  The deciles show us that the distribution of distance to water is quite right-skewed. 
+
+Stacked bar graphs work well to visualize the partial dependence of class probabilities on categorical features:
+
+```{r, message = FALSE}
+month_pdp <- pdp_df_list_multiclass[[12]]$pdp %>% 
+  dplyr::select(month_factor, contains('mean')) %>% 
+  gather(key = class, value = prob, -month_factor)
+
+ggplot(data = month_pdp) + 
+  geom_bar(aes(x = month_factor, fill = class, y = prob), stat='identity') + 
+  scale_fill_discrete(labels= c('Class 0','Class 1','Class 2'), name = '') + 
+  xlab('Month') + ylab('Partial dependence')
+```
+
+Here we can see that class 0 probabilities tend to be highest in summer, inversely related to class 2 probabilities.  Class 1 probabilities appear relatively constant across seasons.
+
+
+
